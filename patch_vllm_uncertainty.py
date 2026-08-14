@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Patch vLLM 0.26.0 to return Ministral3 token uncertainty.
+"""Patch vLLM 0.26.0 to return token uncertainty and LM-head variance.
 
 This is a single-file patcher for Linux vLLM environments, including Vast.ai.
 It patches the installed vLLM package used by the Python interpreter that runs
@@ -16,6 +16,16 @@ Response policy:
 
 The uncertainty head is loaded from ``VLLM_UNCERTAINTY_HEAD_PATH`` or, when
 that variable is absent, ``<model>/heads/log_variance_head.safetensors``.
+
+LM-head variance is an independent, opt-in feature:
+* start ``vllm serve`` with ``--enable-lm-head-variance``;
+* request ``return_lm_head_variance: true`` for an aggregate;
+* request ``return_token_lm_head_variances: true`` for the non-streaming list.
+
+It is the population variance across the raw LM-head vocabulary logits for
+each generated token. It neither reads nor changes the learned uncertainty
+head. Streaming returns the current chunk's last-token value; non-streaming
+returns the mean, optionally with the per-token list.
 """
 
 from __future__ import annotations
@@ -33,7 +43,8 @@ import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-PATCH_ID = "aigen-uncertainty-vllm-0.26.0-v3"
+PATCH_ID = "aigen-uncertainty-vllm-0.26.0-v4"
+LEGACY_PATCH_IDS = {"aigen-uncertainty-vllm-0.26.0-v3"}
 SUPPORTED_VLLM_VERSION = "0.26.0"
 BACKUP_DIRNAME = ".aigen_uncertainty_backup_vllm_0_26_0"
 MANIFEST_NAME = "manifest.json"
@@ -57,6 +68,7 @@ class FilePatch:
 
 
 EXPECTED_SHA256 = {
+    "entrypoints/openai/cli_args.py": "c0deeb051627e1eb54d0b4bb00cf0f751d55729c3ff41377cef58d9c48d9d129",
     "model_executor/models/mistral3.py": "49be7412b7dc20c0b47e68f872f562a105fc106b0b64fb10ddc387d6e01f489c",
     "v1/outputs.py": "1e87bf44162452c1908d3a5003685937dbdc56f5634e35e11ed7b6a5322a1c15",
     "v1/worker/gpu_model_runner.py": "81b7627fbe81f7aaa2f77b4bf085faa353c69d03662ebfe369536a9773bb70d0",
@@ -72,6 +84,43 @@ EXPECTED_SHA256 = {
 
 
 PATCHES = (
+    FilePatch(
+        "entrypoints/openai/cli_args.py",
+        (
+            Replacement(
+                "import argparse\n"
+                "import json\n",
+                "import argparse\n"
+                "import json\n"
+                "import os\n",
+            ),
+            Replacement(
+                "    parser = FrontendArgs.add_cli_args(parser)\n",
+                "    # AIGEN_UNCERTAINTY_PATCH:lm-head-server-option\n"
+                "    parser.add_argument(\n"
+                "        \"--enable-lm-head-variance\",\n"
+                "        action=\"store_true\",\n"
+                "        default=False,\n"
+                "        help=(\n"
+                "            \"Enable request-controlled population variance over \"\n"
+                "            \"raw LM-head vocabulary logits.\"\n"
+                "        ),\n"
+                "    )\n"
+                "    parser = FrontendArgs.add_cli_args(parser)\n",
+            ),
+            Replacement(
+                "def validate_parsed_serve_args(args: argparse.Namespace):\n"
+                "    \"\"\"Quick checks for model serve args that raise prior to loading.\"\"\"\n",
+                "def validate_parsed_serve_args(args: argparse.Namespace):\n"
+                "    \"\"\"Quick checks for model serve args that raise prior to loading.\"\"\"\n"
+                "    # AIGEN_UNCERTAINTY_PATCH:lm-head-server-enable\n"
+                "    if getattr(args, \"enable_lm_head_variance\", False):\n"
+                "        os.environ[\"VLLM_ENABLE_LM_HEAD_VARIANCE\"] = \"1\"\n"
+                "    else:\n"
+                "        os.environ.pop(\"VLLM_ENABLE_LM_HEAD_VARIANCE\", None)\n",
+            ),
+        ),
+    ),
     FilePatch(
         "model_executor/models/mistral3.py",
         (
@@ -204,13 +253,45 @@ PATCHES = (
                 "    num_nans_in_logits: dict[str, int] | None = None\n\n"
                 "    # AIGEN_UNCERTAINTY_PATCH:model-runner-output\n"
                 "    # num_reqs x num_generated_tokens\n"
-                "    uncertainty_log_variances: list[list[float]] | None = None\n",
+                "    uncertainty_log_variances: list[list[float]] | None = None\n"
+                "    # Independent population variance over raw LM-head logits.\n"
+                "    lm_head_variances: list[list[float]] | None = None\n",
             ),
         ),
     ),
     FilePatch(
         "v1/worker/gpu_model_runner.py",
         (
+            Replacement(
+                "import itertools\n"
+                "import threading\n",
+                "import itertools\n"
+                "import os\n"
+                "import threading\n",
+            ),
+            Replacement(
+                "        # Apply structured output bitmasks if present.\n",
+                "        # AIGEN_UNCERTAINTY_PATCH:legacy-lm-head-compute\n"
+                "        lm_head_variances: torch.Tensor | None = None\n"
+                "        lm_head_variance_requested = any(\n"
+                "            bool(\n"
+                "                self.requests[req_id].sampling_params.extra_args.get(\n"
+                "                    \"return_lm_head_variance\", False\n"
+                "                )\n"
+                "            )\n"
+                "            for req_id in self.input_batch.req_ids\n"
+                "            if self.requests[req_id].sampling_params is not None\n"
+                "            and self.requests[req_id].sampling_params.extra_args\n"
+                "        )\n"
+                "        if (\n"
+                "            os.getenv(\"VLLM_ENABLE_LM_HEAD_VARIANCE\") == \"1\"\n"
+                "            and lm_head_variance_requested\n"
+                "        ):\n"
+                "            lm_head_variances = torch.var(\n"
+                "                logits.detach().float(), dim=-1, correction=0\n"
+                "            )\n\n"
+                "        # Apply structured output bitmasks if present.\n",
+            ),
             Replacement(
                 "        with record_function_or_nullcontext(\"gpu_model_runner: sample\"):\n"
                 "            sampler_output = self._sample(logits, spec_decode_metadata)\n\n"
@@ -258,6 +339,27 @@ PATCHES = (
                 "                per_request_log_variances.append(\n"
                 "                    [float(value)] if token_ids else []\n"
                 "                )\n\n"
+                "        per_request_lm_head_variances: list[list[float]] | None = None\n"
+                "        if lm_head_variances is not None and not self.use_async_scheduling:\n"
+                "            lm_head_variance_values = lm_head_variances.cpu().tolist()\n"
+                "            if len(lm_head_variance_values) != len(\n"
+                "                valid_sampled_token_ids\n"
+                "            ):\n"
+                "                raise RuntimeError(\n"
+                "                    \"LM-head variance batch does not match sampled-token batch\"\n"
+                "                )\n"
+                "            per_request_lm_head_variances = []\n"
+                "            for value, token_ids in zip(\n"
+                "                lm_head_variance_values, valid_sampled_token_ids\n"
+                "            ):\n"
+                "                if len(token_ids) > 1:\n"
+                "                    raise RuntimeError(\n"
+                "                        \"LM-head variance does not support speculative \"\n"
+                "                        \"decoding; disable speculative_config\"\n"
+                "                    )\n"
+                "                per_request_lm_head_variances.append(\n"
+                "                    [float(value)] if token_ids else []\n"
+                "                )\n\n"
                 "        with record_function_or_nullcontext(\"gpu_model_runner: ModelRunnerOutput\"):\n"
                 "            output = ModelRunnerOutput(\n",
             ),
@@ -266,6 +368,7 @@ PATCHES = (
                 "                logprobs=logprobs_lists,\n",
                 "                sampled_token_ids=valid_sampled_token_ids,\n"
                 "                uncertainty_log_variances=per_request_log_variances,\n"
+                "                lm_head_variances=per_request_lm_head_variances,\n"
                 "                logprobs=logprobs_lists,\n",
             ),
             Replacement(
@@ -273,6 +376,7 @@ PATCHES = (
                 "        invalid_req_indices: list[int],\n",
                 "        logprobs_tensors: LogprobsTensors | None,\n"
                 "        uncertainty_log_variances: torch.Tensor | None,\n"
+                "        lm_head_variances: torch.Tensor | None,\n"
                 "        invalid_req_indices: list[int],\n",
             ),
             Replacement(
@@ -281,6 +385,7 @@ PATCHES = (
                 "        self._logprobs_tensors = logprobs_tensors\n"
                 "        # AIGEN_UNCERTAINTY_PATCH:legacy-async-retain\n"
                 "        self._uncertainty_log_variances = uncertainty_log_variances\n"
+                "        self._lm_head_variances = lm_head_variances\n"
                 "        self._routed_experts = routed_experts\n",
             ),
             Replacement(
@@ -303,6 +408,11 @@ PATCHES = (
                 "                if self._uncertainty_log_variances is not None\n"
                 "                else None\n"
                 "            )\n"
+                "            self._lm_head_variances_cpu = (\n"
+                "                self._lm_head_variances.to(\"cpu\", non_blocking=True)\n"
+                "                if self._lm_head_variances is not None\n"
+                "                else None\n"
+                "            )\n"
                 "            self._routed_experts_cpu = (\n",
             ),
             Replacement(
@@ -310,7 +420,8 @@ PATCHES = (
                 "        del self._sampled_token_ids\n",
                 "        del self._logprobs_tensors\n"
                 "        del self._sampled_token_ids\n"
-                "        del self._uncertainty_log_variances\n",
+                "        del self._uncertainty_log_variances\n"
+                "        del self._lm_head_variances\n",
             ),
             Replacement(
                 "        output.sampled_token_ids = valid_sampled_token_ids\n"
@@ -336,6 +447,21 @@ PATCHES = (
                 "                    )\n"
                 "                per_request.append([float(value)] if token_ids else [])\n"
                 "            output.uncertainty_log_variances = per_request\n\n"
+                "        if self._lm_head_variances_cpu is not None:\n"
+                "            values = self._lm_head_variances_cpu.reshape(-1).tolist()\n"
+                "            if len(values) != len(valid_sampled_token_ids):\n"
+                "                raise RuntimeError(\n"
+                "                    \"LM-head variance batch does not match sampled-token batch\"\n"
+                "                )\n"
+                "            per_request_lm: list[list[float]] = []\n"
+                "            for value, token_ids in zip(values, valid_sampled_token_ids):\n"
+                "                if len(token_ids) > 1:\n"
+                "                    raise RuntimeError(\n"
+                "                        \"LM-head variance does not support speculative \"\n"
+                "                        \"decoding; disable speculative_config\"\n"
+                "                    )\n"
+                "                per_request_lm.append([float(value)] if token_ids else [])\n"
+                "            output.lm_head_variances = per_request_lm\n\n"
                 "        if self._routed_experts_cpu is not None:\n",
             ),
             Replacement(
@@ -343,6 +469,7 @@ PATCHES = (
                 "                invalid_req_indices=invalid_req_indices,\n",
                 "                logprobs_tensors=sampler_output.logprobs_tensors,\n"
                 "                uncertainty_log_variances=uncertainty_log_variances,\n"
+                "                lm_head_variances=lm_head_variances,\n"
                 "                invalid_req_indices=invalid_req_indices,\n",
             ),
         ),
@@ -351,13 +478,89 @@ PATCHES = (
         "v1/worker/gpu/model_runner.py",
         (
             Replacement(
+                "import functools\n"
+                "import gc\n",
+                "import functools\n"
+                "import gc\n"
+                "import os\n",
+            ),
+            Replacement(
+                "        self.input_buffers = InputBuffers(\n",
+                "        # AIGEN_UNCERTAINTY_PATCH:v2-lm-head-request-state\n"
+                "        self._lm_head_variance_req_ids: set[str] = set()\n"
+                "        self.input_buffers = InputBuffers(\n",
+            ),
+            Replacement(
+                "    def _remove_request(self, req_id: str) -> bool:\n"
+                "        # Call model_state.remove_request *before* req_states.remove_request\n",
+                "    def _remove_request(self, req_id: str) -> bool:\n"
+                "        self._lm_head_variance_req_ids.discard(req_id)\n"
+                "        # Call model_state.remove_request *before* req_states.remove_request\n",
+            ),
+            Replacement(
+                "            sampling_params = new_req_data.sampling_params\n"
+                "            self.req_states.add_request(\n",
+                "            sampling_params = new_req_data.sampling_params\n"
+                "            if (\n"
+                "                sampling_params is not None\n"
+                "                and sampling_params.extra_args\n"
+                "                and sampling_params.extra_args.get(\n"
+                "                    \"return_lm_head_variance\", False\n"
+                "                )\n"
+                "            ):\n"
+                "                self._lm_head_variance_req_ids.add(req_id)\n"
+                "            self.req_states.add_request(\n",
+            ),
+            Replacement(
+                "    ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:\n"
+                "        sample_hidden_states = hidden_states[input_batch.logits_indices]\n"
+                "        logits = self.model.compute_logits(sample_hidden_states)\n"
+                "        if grammar_output is not None:\n",
+                "    ) -> tuple[\n"
+                "        SamplerOutput, torch.Tensor, torch.Tensor, torch.Tensor | None\n"
+                "    ]:\n"
+                "        sample_hidden_states = hidden_states[input_batch.logits_indices]\n"
+                "        logits = self.model.compute_logits(sample_hidden_states)\n"
+                "        # AIGEN_UNCERTAINTY_PATCH:v2-lm-head-compute\n"
+                "        lm_head_variances: torch.Tensor | None = None\n"
+                "        lm_head_variance_requested = any(\n"
+                "            req_id in self._lm_head_variance_req_ids\n"
+                "            for req_id in input_batch.req_ids\n"
+                "        )\n"
+                "        if (\n"
+                "            os.getenv(\"VLLM_ENABLE_LM_HEAD_VARIANCE\") == \"1\"\n"
+                "            and lm_head_variance_requested\n"
+                "        ):\n"
+                "            if input_batch.num_draft_tokens != 0:\n"
+                "                raise RuntimeError(\n"
+                "                    \"LM-head variance does not support speculative \"\n"
+                "                    \"decoding; disable speculative_config\"\n"
+                "                )\n"
+                "            lm_head_variances = torch.var(\n"
+                "                logits.detach().float(), dim=-1, correction=0\n"
+                "            )\n"
+                "        if grammar_output is not None:\n",
+            ),
+            Replacement(
+                "        return sampler_output, sampler_output.num_sampled, sampler_output.num_rejected\n",
+                "        return (\n"
+                "            sampler_output,\n"
+                "            sampler_output.num_sampled,\n"
+                "            sampler_output.num_rejected,\n"
+                "            lm_head_variances,\n"
+                "        )\n",
+            ),
+            Replacement(
                 "        sampler_output, num_sampled, num_rejected = self.sample(\n"
                 "            hidden_states, input_batch, grammar_output\n"
                 "        )\n\n"
                 "        if self.pp_handler is not None:\n",
-                "        sampler_output, num_sampled, num_rejected = self.sample(\n"
-                "            hidden_states, input_batch, grammar_output\n"
-                "        )\n\n"
+                "        (\n"
+                "            sampler_output,\n"
+                "            num_sampled,\n"
+                "            num_rejected,\n"
+                "            lm_head_variances,\n"
+                "        ) = self.sample(hidden_states, input_batch, grammar_output)\n\n"
                 "        # AIGEN_UNCERTAINTY_PATCH:v2-gpu-compute\n"
                 "        uncertainty_log_variances = None\n"
                 "        compute_uncertainty = getattr(self.model, \"compute_uncertainty\", None)\n"
@@ -381,6 +584,7 @@ PATCHES = (
                 "            main_stream=self.main_stream,\n",
                 "            num_sampled_tokens=num_sampled,\n"
                 "            uncertainty_log_variances=uncertainty_log_variances,\n"
+                "            lm_head_variances=lm_head_variances,\n"
                 "            main_stream=self.main_stream,\n",
             ),
         ),
@@ -393,6 +597,7 @@ PATCHES = (
                 "        main_stream: torch.cuda.Stream,\n",
                 "        num_sampled_tokens: torch.Tensor,\n"
                 "        uncertainty_log_variances: torch.Tensor | None,\n"
+                "        lm_head_variances: torch.Tensor | None,\n"
                 "        main_stream: torch.cuda.Stream,\n",
             ),
             Replacement(
@@ -403,6 +608,11 @@ PATCHES = (
                 "            self.uncertainty_log_variances_np = (\n"
                 "                async_copy_to_np(uncertainty_log_variances)\n"
                 "                if uncertainty_log_variances is not None\n"
+                "                else None\n"
+                "            )\n"
+                "            self.lm_head_variances_np = (\n"
+                "                async_copy_to_np(lm_head_variances)\n"
+                "                if lm_head_variances is not None\n"
                 "                else None\n"
                 "            )\n"
                 "            self.prompt_logprobs_dict = {\n",
@@ -427,6 +637,21 @@ PATCHES = (
                 "                    )\n"
                 "                per_request.append([float(value)] if token_ids else [])\n"
                 "            self.model_runner_output.uncertainty_log_variances = per_request\n\n"
+                "        if self.lm_head_variances_np is not None:\n"
+                "            values = self.lm_head_variances_np.reshape(-1).tolist()\n"
+                "            if len(values) != len(sampled_token_ids):\n"
+                "                raise RuntimeError(\n"
+                "                    \"LM-head variance batch does not match sampled-token batch\"\n"
+                "                )\n"
+                "            per_request_lm: list[list[float]] = []\n"
+                "            for value, token_ids in zip(values, sampled_token_ids):\n"
+                "                if len(token_ids) > 1:\n"
+                "                    raise RuntimeError(\n"
+                "                        \"LM-head variance does not support speculative \"\n"
+                "                        \"decoding; disable speculative_config\"\n"
+                "                    )\n"
+                "                per_request_lm.append([float(value)] if token_ids else [])\n"
+                "            self.model_runner_output.lm_head_variances = per_request_lm\n\n"
                 "        if self.num_nans is not None:\n",
             ),
         ),
@@ -440,6 +665,7 @@ PATCHES = (
                 "    new_logprobs: LogprobsLists | None = None\n"
                 "    # AIGEN_UNCERTAINTY_PATCH:engine-output\n"
                 "    new_log_variances: list[float] | None = None\n"
+                "    new_lm_head_variances: list[float] | None = None\n"
                 "    new_prompt_logprobs_tensors: LogprobsTensors | None = None\n",
             ),
         ),
@@ -455,6 +681,7 @@ PATCHES = (
                 "        uncertainty_log_variances = (\n"
                 "            model_runner_output.uncertainty_log_variances\n"
                 "        )\n"
+                "        lm_head_variances = model_runner_output.lm_head_variances\n"
                 "        logprobs = model_runner_output.logprobs\n",
             ),
             Replacement(
@@ -470,6 +697,14 @@ PATCHES = (
                 "                            and new_token_ids\n"
                 "                            else None\n"
                 "                        ),\n"
+                "                        new_lm_head_variances=(\n"
+                "                            lm_head_variances[req_index][\n"
+                "                                : len(new_token_ids)\n"
+                "                            ]\n"
+                "                            if lm_head_variances is not None\n"
+                "                            and new_token_ids\n"
+                "                            else None\n"
+                "                        ),\n"
                 "                        new_prompt_logprobs_tensors=prompt_logprobs_tensors,\n",
             ),
         ),
@@ -482,7 +717,8 @@ PATCHES = (
                 "    def finished(self) -> bool:\n",
                 "    lora_request: LoRARequest | None = None\n"
                 "    # AIGEN_UNCERTAINTY_PATCH:completion-output\n"
-                "    log_variances: GenericSequence[float] | None = None\n\n"
+                "    log_variances: GenericSequence[float] | None = None\n"
+                "    lm_head_variances: GenericSequence[float] | None = None\n\n"
                 "    def finished(self) -> bool:\n",
             ),
             Replacement(
@@ -506,6 +742,18 @@ PATCHES = (
                 "                            completion.log_variances.extend(\n"
                 "                                next_completion.log_variances\n"
                 "                            )\n"
+                "                        if next_completion.lm_head_variances:\n"
+                "                            if completion.lm_head_variances is None:\n"
+                "                                completion.lm_head_variances = []\n"
+                "                            elif not isinstance(\n"
+                "                                completion.lm_head_variances, MutableSequence\n"
+                "                            ):\n"
+                "                                completion.lm_head_variances = list(\n"
+                "                                    completion.lm_head_variances\n"
+                "                                )\n"
+                "                            completion.lm_head_variances.extend(\n"
+                "                                next_completion.lm_head_variances\n"
+                "                            )\n"
                 "                        completion.cumulative_logprob = (\n",
             ),
         ),
@@ -517,7 +765,8 @@ PATCHES = (
                 "        self.sent_tokens_offset = 0  # Offset of sent tokens\n",
                 "        self.sent_tokens_offset = 0  # Offset of sent tokens\n"
                 "        # AIGEN_UNCERTAINTY_PATCH:request-state\n"
-                "        self.log_variances: list[float] = []\n",
+                "        self.log_variances: list[float] = []\n"
+                "        self.lm_head_variances: list[float] = []\n",
             ),
             Replacement(
                 "            new_token_ids = engine_core_output.new_token_ids\n"
@@ -527,6 +776,10 @@ PATCHES = (
                 "            if engine_core_output.new_log_variances:\n"
                 "                req_state.log_variances.extend(\n"
                 "                    engine_core_output.new_log_variances\n"
+                "                )\n"
+                "            if engine_core_output.new_lm_head_variances:\n"
+                "                req_state.lm_head_variances.extend(\n"
+                "                    engine_core_output.new_lm_head_variances\n"
                 "                )\n"
                 "            pooling_output = engine_core_output.pooling_output\n",
             ),
@@ -544,6 +797,13 @@ PATCHES = (
                 "                if token_ids\n"
                 "                else []\n"
                 "            ),\n"
+                "            lm_head_variances=(\n"
+                "                list(self.lm_head_variances)\n"
+                "                if not delta\n"
+                "                else list(self.lm_head_variances[-len(token_ids) :])\n"
+                "                if token_ids\n"
+                "                else []\n"
+                "            ),\n"
                 "        )\n",
             ),
         ),
@@ -551,6 +811,13 @@ PATCHES = (
     FilePatch(
         "entrypoints/openai/chat_completion/protocol.py",
         (
+            Replacement(
+                "        extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}\n",
+                "        extra_args: dict[str, Any] = self.vllm_xargs if self.vllm_xargs else {}\n"
+                "        # AIGEN_UNCERTAINTY_PATCH:lm-head-request-propagation\n"
+                "        if self.return_lm_head_variance:\n"
+                "            extra_args[\"return_lm_head_variance\"] = True\n",
+            ),
             Replacement(
                 "class ChatCompletionResponseChoice(OpenAIBaseModel):\n",
                 "# AIGEN_UNCERTAINTY_PATCH:response-schema\n"
@@ -561,13 +828,20 @@ PATCHES = (
                 "    mean_log_variance: float | None = None\n"
                 "    token_variances: list[float] | None = None\n"
                 "    token_log_variances: list[float] | None = None\n\n\n"
+                "class LMHeadVarianceInfo(OpenAIBaseModel):\n"
+                "    variance: float\n"
+                "    aggregation: Literal[\"mean\", \"last\"]\n"
+                "    last_variance: float\n"
+                "    token_variances: list[float] | None = None\n"
+                "    source: Literal[\"raw_lm_head_logits\"] = \"raw_lm_head_logits\"\n\n\n"
                 "class ChatCompletionResponseChoice(OpenAIBaseModel):\n",
             ),
             Replacement(
                 "    routed_experts: str | None = None\n\n\n"
                 "class ChatCompletionResponse(OpenAIBaseModel):\n",
                 "    routed_experts: str | None = None\n"
-                "    uncertainty: UncertaintyInfo | None = None\n\n\n"
+                "    uncertainty: UncertaintyInfo | None = None\n"
+                "    lm_head_variance: LMHeadVarianceInfo | None = None\n\n\n"
                 "class ChatCompletionResponse(OpenAIBaseModel):\n",
             ),
             Replacement(
@@ -576,7 +850,8 @@ PATCHES = (
                 "class ChatCompletionStreamResponse(OpenAIBaseModel):\n",
                 "    # not part of the OpenAI spec but for tracing the tokens\n"
                 "    token_ids: list[int] | None = None\n"
-                "    uncertainty: UncertaintyInfo | None = None\n\n\n"
+                "    uncertainty: UncertaintyInfo | None = None\n"
+                "    lm_head_variance: LMHeadVarianceInfo | None = None\n\n\n"
                 "class ChatCompletionStreamResponse(OpenAIBaseModel):\n",
             ),
             Replacement(
@@ -587,6 +862,22 @@ PATCHES = (
                 "        description=(\n"
                 "            \"Return generated-token variance and log-variance lists. \"\n"
                 "            \"The aggregate variance is returned regardless.\"\n"
+                "        ),\n"
+                "    )\n"
+                "    return_lm_head_variance: bool = Field(\n"
+                "        default=False,\n"
+                "        description=(\n"
+                "            \"Return population variance over raw LM-head vocabulary \"\n"
+                "            \"logits. Non-streaming returns the generated-token mean; \"\n"
+                "            \"streaming returns the current chunk's last-token value.\"\n"
+                "        ),\n"
+                "    )\n"
+                "    return_token_lm_head_variances: bool = Field(\n"
+                "        default=False,\n"
+                "        description=(\n"
+                "            \"Include the per-generated-token raw LM-head logit \"\n"
+                "            \"variance list in a non-streaming response. Requires \"\n"
+                "            \"return_lm_head_variance=true.\"\n"
                 "        ),\n"
                 "    )\n"
                 "    return_token_offsets: bool | None = Field(\n",
@@ -603,6 +894,7 @@ PATCHES = (
                 "import asyncio\n"
                 "import io\n"
                 "import math\n"
+                "import os\n"
                 "import time\n",
             ),
             Replacement(
@@ -611,6 +903,7 @@ PATCHES = (
                 ")\n",
                 "    ChatCompletionStreamResponse,\n"
                 "    ChatMessage,\n"
+                "    LMHeadVarianceInfo,\n"
                 "    UncertaintyInfo,\n"
                 ")\n",
             ),
@@ -642,7 +935,49 @@ PATCHES = (
                 "        token_variances=variance_values if include_tokens else None,\n"
                 "        token_log_variances=log_values if include_tokens else None,\n"
                 "    )\n\n\n"
+                "def _build_lm_head_variance_info(\n"
+                "    variances: GenericSequence[float] | None,\n"
+                "    aggregation: str,\n"
+                "    include_tokens: bool,\n"
+                ") -> LMHeadVarianceInfo | None:\n"
+                "    if not variances:\n"
+                "        return None\n"
+                "    values = [float(value) for value in variances]\n"
+                "    aggregate = (\n"
+                "        values[-1]\n"
+                "        if aggregation == \"last\"\n"
+                "        else sum(values) / len(values)\n"
+                "    )\n"
+                "    return LMHeadVarianceInfo(\n"
+                "        variance=aggregate,\n"
+                "        aggregation=aggregation,\n"
+                "        last_variance=values[-1],\n"
+                "        token_variances=values if include_tokens else None,\n"
+                "    )\n\n\n"
                 "def _get_mm_token_counts",
+            ),
+            Replacement(
+                "    ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:\n"
+                "        # Streaming response\n",
+                "    ) -> AsyncGenerator[str, None] | ChatCompletionResponse | ErrorResponse:\n"
+                "        # AIGEN_UNCERTAINTY_PATCH:lm-head-request-validation\n"
+                "        if (\n"
+                "            request.return_token_lm_head_variances\n"
+                "            and not request.return_lm_head_variance\n"
+                "        ):\n"
+                "            return self.create_error_response(\n"
+                "                \"return_token_lm_head_variances requires \"\n"
+                "                \"return_lm_head_variance=true\"\n"
+                "            )\n"
+                "        if (\n"
+                "            request.return_lm_head_variance\n"
+                "            and os.getenv(\"VLLM_ENABLE_LM_HEAD_VARIANCE\") != \"1\"\n"
+                "        ):\n"
+                "            return self.create_error_response(\n"
+                "                \"LM-head variance is disabled; restart vllm serve with \"\n"
+                "                \"--enable-lm-head-variance\"\n"
+                "            )\n"
+                "        # Streaming response\n",
             ),
             Replacement(
                 "                    choice_data = maybe_filter_parallel_tool_calls(choice_data, request)\n"
@@ -653,6 +988,14 @@ PATCHES = (
                 "                        aggregation=\"last\",\n"
                 "                        include_tokens=request.return_token_variances,\n"
                 "                    )\n"
+                "                    if request.return_lm_head_variance:\n"
+                "                        choice_data.lm_head_variance = (\n"
+                "                            _build_lm_head_variance_info(\n"
+                "                                output.lm_head_variances,\n"
+                "                                aggregation=\"last\",\n"
+                "                                include_tokens=False,\n"
+                "                            )\n"
+                "                        )\n"
                 "                    choice_data = maybe_filter_parallel_tool_calls(choice_data, request)\n"
                 "                    chunk = ChatCompletionStreamResponse(\n",
             ),
@@ -664,6 +1007,16 @@ PATCHES = (
                 "                aggregation=\"mean\",\n"
                 "                include_tokens=request.return_token_variances,\n"
                 "            )\n"
+                "            if request.return_lm_head_variance:\n"
+                "                choice_data.lm_head_variance = (\n"
+                "                    _build_lm_head_variance_info(\n"
+                "                        output.lm_head_variances,\n"
+                "                        aggregation=\"mean\",\n"
+                "                        include_tokens=(\n"
+                "                            request.return_token_lm_head_variances\n"
+                "                        ),\n"
+                "                    )\n"
+                "                )\n"
                 "            choice_data = maybe_filter_parallel_tool_calls(choice_data, request)\n\n"
                 "            choices.append(choice_data)\n",
             ),
@@ -802,7 +1155,7 @@ def apply_patch(package_root: Path, force: bool, yes: bool) -> None:
     print(f"vLLM:  {version or 'source checkout'}")
     print(f"Files: {len(transformed)}")
     if not yes:
-        answer = input("Apply uncertainty patch? [y/N] ").strip().lower()
+        answer = input("Apply uncertainty/LM-head patch? [y/N] ").strip().lower()
         if answer not in {"y", "yes"}:
             print("Cancelled")
             return
@@ -847,7 +1200,8 @@ def revert_patch(package_root: Path, yes: bool) -> None:
     if not manifest_path.is_file():
         raise PatchError(f"backup manifest not found: {manifest_path}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("patch_id") != PATCH_ID:
+    manifest_patch_id = manifest.get("patch_id")
+    if manifest_patch_id != PATCH_ID and manifest_patch_id not in LEGACY_PATCH_IDS:
         raise PatchError("backup belongs to a different patch")
     files = manifest["files"]
     print(f"Restore {len(files)} files in {package_root}")
@@ -878,7 +1232,10 @@ def show_status(package_root: Path) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Patch vLLM 0.26.0 with Ministral3 uncertainty output"
+        description=(
+            "Patch vLLM 0.26.0 with Ministral3 uncertainty and raw "
+            "LM-head logit variance output"
+        )
     )
     parser.add_argument("command", choices=("status", "check", "apply", "revert"))
     parser.add_argument(
